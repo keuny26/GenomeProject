@@ -50,24 +50,23 @@ def analyze_graph_with_ai(text):
     """
     try:
         response = model.generate_content(prompt)
-        # JSON 부분만 추출
         json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
         if json_match:
             return json.loads(json_match.group())
         return None
     except Exception as e:
-        st.error(f"AI 분석 중 오류 발생: {e}")
+        if "429" in str(e):
+            st.error("API 할당량을 초과했습니다. 약 1분 후 다시 시도하거나 새 API 키를 사용하세요.")
+        else:
+            st.error(f"AI 분석 중 오류 발생: {e}")
         return None
 
 # --- 메인 UI: 다중 파일 업로드 ---
 uploaded_files = st.file_uploader("PDF 보고서들을 업로드하세요", type="pdf", accept_multiple_files=True)
 
-# 업로드된 파일들의 이름 리스트를 추적하여 변경 감지
-current_file_names = [f.name for f in uploaded_files] if uploaded_files else []
-
 if uploaded_files and api_key:
-    # 파일 구성이 바뀌면(새 파일 추가/삭제) 세션 강제 초기화 및 재분석
-    if "last_files" not in st.session_state or st.session_state.last_files != current_file_names:
+    # 쿼터 보호를 위한 분석 시작 버튼
+    if st.button("🧬 통합 분석 시작 (API 호출)"):
         with st.spinner("새로운 파일을 포함하여 통합 분석 중..."):
             combined_text = ""
             for uploaded_file in uploaded_files:
@@ -76,23 +75,23 @@ if uploaded_files and api_key:
                 combined_text += " ".join([page.get_text() for page in doc])
             
             st.session_state.full_text = combined_text
-            st.session_state.last_files = current_file_names  # 파일 리스트 업데이트
+            # 파일이 바뀐 것을 인지하도록 강제 업데이트
+            st.session_state.last_files = [f.name for f in uploaded_files]
             st.session_state.graph_data = analyze_graph_with_ai(st.session_state.full_text)
             st.session_state.messages = []
+            st.success("분석이 완료되었습니다!")
 
-    # 2. 그래프 영역
+    # 2. 그래프 영역 (세션에 데이터가 있을 때만 표시)
     if st.session_state.get("graph_data"):
         st.subheader("🧬 통합 지식 그래프")
         
         col1, col2 = st.columns([3, 1])
         
         with col1:
-            # --- KeyError 방지를 위한 안전한 노드/간선 생성 ---
             nodes = []
             raw_nodes = st.session_state.graph_data.get('nodes', [])
             for n in raw_nodes:
                 if 'id' in n:
-                    # label이 없으면 id를 대신 사용, desc가 없으면 기본값 사용
                     l_text = n.get('label', n['id'])
                     n_type = n.get('type', 'gene')
                     n_color = '#4285F4' if n_type == 'gene' else '#EA4335'
@@ -104,52 +103,40 @@ if uploaded_files and api_key:
                 if 'source' in l and 'target' in l:
                     edges.append(Edge(source=l['source'], target=l['target']))
 
-            # 노드가 존재할 때만 그래프 렌더링
             if nodes:
-                config = Config(
-                    width=900, 
-                    height=600, 
-                    directed=True, 
-                    physics=True, 
-                    hierarchical=False,
-                    fit_view=True  # 그래프를 화면 중앙에 자동으로 맞춤
-                )
+                config = Config(width=900, height=600, directed=True, physics=True, fit_view=True)
                 selected_id = agraph(nodes=nodes, edges=edges, config=config)
             else:
-                st.warning("그래프를 생성할 유효한 데이터가 없습니다.")
+                st.warning("그래프 데이터가 비어 있습니다.")
                 selected_id = None
 
         with col2:
             st.markdown("### 🔍 상세 정보")
             if selected_id:
-                # 선택된 노드의 상세 정보 찾기
                 node_detail = next((n for n in st.session_state.graph_data.get('nodes', []) if str(n.get('id')) == str(selected_id)), None)
                 if node_detail:
                     st.success(f"**명칭:** {node_detail.get('label', selected_id)}")
                     st.info(f"**설명:** {node_detail.get('desc', '설명 정보가 없습니다.')}")
-                else:
-                    st.write("상세 정보를 불러올 수 없습니다.")
             else:
-                st.write("💡 그래프의 노드를 클릭하면 상세 정보가 여기에 표시됩니다.")
+                st.write("💡 노드를 클릭하세요.")
 
-    st.divider()
+        st.divider()
 
-    # 3. 채팅 영역
-    st.subheader("💬 통합 분석 채팅")
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+        # 3. 채팅 영역
+        st.subheader("💬 통합 분석 채팅")
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
 
-    if prompt := st.chat_input("질문하세요."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        with st.chat_message("assistant"):
-            with st.spinner("생각 중..."):
-                try:
-                    # 문서 내용과 함께 질문 던지기
-                    response = model.generate_content(f"문서 통합본 내용: {st.session_state.full_text[:8000]}\n\n질문: {prompt}")
-                    st.markdown(response.text)
-                    st.session_state.messages.append({"role": "assistant", "content": response.text})
-                except Exception as e:
-                    st.error(f"채팅 응답 중 오류가 발생했습니다: {e}")
+        if prompt := st.chat_input("질문하세요."):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            with st.chat_message("assistant"):
+                with st.spinner("생각 중..."):
+                    try:
+                        response = model.generate_content(f"내용: {st.session_state.full_text[:8000]}\n\n질문: {prompt}")
+                        st.markdown(response.text)
+                        st.session_state.messages.append({"role": "assistant", "content": response.text})
+                    except Exception as e:
+                        st.error(f"채팅 중 오류(할당량 확인 필요): {e}")
