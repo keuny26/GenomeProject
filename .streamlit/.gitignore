@@ -1,0 +1,12 @@
+# API 키 및 환경변수 파일 제외
+.env
+backend/.env
+.streamlit/secrets.toml
+
+# 파이썬 컴파일 파일 및 캐시 제외
+__pycache__/
+*.pyc
+
+# 기타 시스템 파일
+.DS_Store
+Thumbs.db
