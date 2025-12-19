@@ -7,9 +7,9 @@ from streamlit_agraph import agraph, Node, Edge, Config
 
 # --- 페이지 설정 ---
 st.set_page_config(page_title="GenomeGraph AI", layout="wide")
-st.title("🧬 GenomeGraph AI (Clean View)")
+st.title("🧬 GenomeGraph AI (Clean Labels)")
 
-# --- 세션 상태 초기화 ---
+# --- 세션 상태 초기화 (AttributeError 방지) ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "full_text" not in st.session_state:
@@ -24,7 +24,7 @@ else:
     st.sidebar.title("설정")
     api_key = st.sidebar.text_input("Gemini API Key를 입력하세요", type="password")
 
-# --- 모델 초기화 (자동 감지 로직 유지) ---
+# --- 모델 초기화 (자동 감지 로직) ---
 model = None
 if api_key:
     try:
@@ -37,7 +37,7 @@ if api_key:
         elif available_models:
             fallback = available_models[0].replace('models/', '')
             model = genai.GenerativeModel(fallback)
-            st.sidebar.warning(f"Flash 모델 미지원으로 {fallback} 연결됨")
+            st.sidebar.warning(f"Flash 모델 미지원으로 {fallback} 모델에 연결되었습니다.")
         
         if model:
             st.sidebar.success(f"연결됨: {model.model_name}")
@@ -48,25 +48,28 @@ if api_key:
 def analyze_graph_with_ai(text):
     if not model: return None
     prompt = f"""
-    당신은 전문 유전체 분석가입니다. 유전자와 질환 관계를 추출하여 JSON으로 응답하세요.
-    1. 모든 노드에 'source_file' 필드를 포함하세요.
+    당신은 전문 유전체 분석가입니다. 제공된 텍스트에서 유전자와 질환 관계를 추출하세요.
+    1. 모든 노드에 'source_file' 필드를 추가하여 출처를 기록하세요.
     2. 공통 노드는 'source_file'을 "Common"으로 하세요.
+    3. 반드시 JSON 형식으로만 응답하세요.
     텍스트: {text[:20000]}
     """
     try:
         response = model.generate_content(prompt)
         json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
-        return json.loads(json_match.group()) if json_match else None
+        if json_match:
+            return json.loads(json_match.group())
+        return None
     except Exception as e:
         st.error(f"AI 분석 중 오류: {e}")
         return None
 
-# --- 메인 UI ---
+# --- 메인 UI: 다중 파일 업로드 ---
 uploaded_files = st.file_uploader("PDF 보고서들을 업로드하세요", type="pdf", accept_multiple_files=True)
 
 if uploaded_files and api_key:
     if st.button("🧬 파일별 통합 분석 시작"):
-        with st.spinner("분석 중..."):
+        with st.spinner("데이터 분석 중..."):
             combined_text = ""
             for uploaded_file in uploaded_files:
                 doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
@@ -76,6 +79,7 @@ if uploaded_files and api_key:
             st.session_state.full_text = combined_text
             st.session_state.graph_data = analyze_graph_with_ai(st.session_state.full_text)
             st.session_state.messages = [] 
+            st.success("분석이 완료되었습니다!")
 
     # 2. 그래프 영역
     if st.session_state.graph_data:
@@ -94,11 +98,11 @@ if uploaded_files and api_key:
                 n_color = color_map.get(src, "#999999")
                 n_size = 35 if src == "Common" else 25
                 
-                # --- 수정된 부분: 레이블에서 PDF 이름 제거 ---
-                # 공통 노드일 때만 ⭐ 아이콘을 붙이고, 나머지는 순수 이름만 표시
-                display_label = f"⭐ {n.get('label')}" if src == "Common" else n.get('label')
+                # --- ✅ 수정 포인트: [pdf이름] 태그를 삭제하고 순수 이름만 표시 ---
+                # 공통 노드일 때만 구분을 위해 별표(⭐)를 유지하고, 아니면 레이블 그대로 사용
+                clean_label = f"⭐ {n.get('label')}" if src == "Common" else n.get('label')
                 
-                nodes.append(Node(id=n['id'], label=display_label, size=n_size, color=n_color))
+                nodes.append(Node(id=n['id'], label=clean_label, size=n_size, color=n_color))
             
             edges = [Edge(source=l['source'], target=l['target']) for l in st.session_state.graph_data.get('links', [])]
 
@@ -109,7 +113,7 @@ if uploaded_files and api_key:
                 if st.button("🎯 그래프 중앙 정렬"):
                     st.rerun()
             else:
-                st.warning("분석 데이터가 없습니다.")
+                st.warning("분석 결과가 없습니다.")
                 selected_id = None
 
         with col2:
@@ -126,7 +130,8 @@ if uploaded_files and api_key:
                     st.write(f"**분석 상세:**\n{node_detail.get('desc', '설명 없음')}")
 
     st.divider()
-    # 3. 채팅 영역 (생략 - 기존과 동일)
+
+    # 3. 채팅 영역
     st.subheader("💬 통합 분석 채팅")
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -134,10 +139,12 @@ if uploaded_files and api_key:
 
     if prompt := st.chat_input("질문하세요."):
         st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"): st.markdown(prompt)
+        with st.chat_message("user"):
+            st.markdown(prompt)
         with st.chat_message("assistant"):
             try:
-                res = model.generate_content(f"내용: {st.session_state.full_text[:8000]}\n질문: {prompt}")
+                res = model.generate_content(f"내용 요약: {st.session_state.full_text[:8000]}\n질문: {prompt}")
                 st.markdown(res.text)
                 st.session_state.messages.append({"role": "assistant", "content": res.text})
-            except Exception as e: st.error(f"오류: {e}")
+            except Exception as e:
+                st.error(f"오류: {e}")
