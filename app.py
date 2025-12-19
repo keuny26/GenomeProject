@@ -37,24 +37,36 @@ if api_key:
 def analyze_graph_with_ai(text):
     if not model: return None
     prompt = f"""
-    유전체 분석가로서 텍스트에서 유전자와 질환 관계를 추출해 JSON으로만 답하세요. 
-    반드시 'nodes'와 'links'를 포함하고 각 노드에 'desc'를 넣으세요.
+    당신은 유전체 분석가입니다. 제공된 텍스트에서 유전자와 질환 관계를 추출하여 JSON으로만 응답하세요.
+    반드시 'nodes'와 'links' 키를 포함하고, 각 노드에는 'id', 'label', 'type', 'desc' 필드를 포함하세요.
+    
+    형식 예시:
+    {{
+      "nodes": [{{ "id": "G1", "label": "BRCA1", "type": "gene", "desc": "유방암 위험 증가와 관련된 유전자" }}],
+      "links": [{{ "source": "G1", "target": "D1" }}]
+    }}
+    
     텍스트: {text[:15000]}
     """
     try:
         response = model.generate_content(prompt)
+        # JSON 부분만 추출
         json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
-        return json.loads(json_match.group()) if json_match else None
-    except: return None
+        if json_match:
+            return json.loads(json_match.group())
+        return None
+    except Exception as e:
+        st.error(f"AI 분석 중 오류 발생: {e}")
+        return None
 
 # --- 메인 UI: 다중 파일 업로드 ---
 uploaded_files = st.file_uploader("PDF 보고서들을 업로드하세요", type="pdf", accept_multiple_files=True)
 
-# 핵심 변경 사항: 업로드된 파일들의 이름 리스트를 추적하여 변경 감지
+# 업로드된 파일들의 이름 리스트를 추적하여 변경 감지
 current_file_names = [f.name for f in uploaded_files] if uploaded_files else []
 
 if uploaded_files and api_key:
-    # 파일 구성이 바뀌면(새 파일 추가/삭제) 세션 강제 초기화
+    # 파일 구성이 바뀌면(새 파일 추가/삭제) 세션 강제 초기화 및 재분석
     if "last_files" not in st.session_state or st.session_state.last_files != current_file_names:
         with st.spinner("새로운 파일을 포함하여 통합 분석 중..."):
             combined_text = ""
@@ -75,30 +87,50 @@ if uploaded_files and api_key:
         col1, col2 = st.columns([3, 1])
         
         with col1:
-            nodes = [Node(id=n['id'], label=n['label'], size=25, color=('#4285F4' if n.get('type') == 'gene' else '#EA4335')) 
-                     for n in st.session_state.graph_data.get('nodes', [])]
-            edges = [Edge(source=l['source'], target=l['target']) for l in st.session_state.graph_data.get('links', [])]
+            # --- KeyError 방지를 위한 안전한 노드/간선 생성 ---
+            nodes = []
+            raw_nodes = st.session_state.graph_data.get('nodes', [])
+            for n in raw_nodes:
+                if 'id' in n:
+                    # label이 없으면 id를 대신 사용, desc가 없으면 기본값 사용
+                    l_text = n.get('label', n['id'])
+                    n_type = n.get('type', 'gene')
+                    n_color = '#4285F4' if n_type == 'gene' else '#EA4335'
+                    nodes.append(Node(id=n['id'], label=l_text, size=25, color=n_color))
             
-            # 그래프 설정 개선 (중앙 정렬 및 물리 엔진 최적화)
-            config = Config(
-                width=900, 
-                height=600, 
-                directed=True, 
-                physics=True, 
-                hierarchical=False, # 유전체 관계는 계층보다 네트워크 형태가 적합
-                fit_view=True       # 그래프를 화면 중앙에 자동으로 맞춤
-            )
-            selected_id = agraph(nodes=nodes, edges=edges, config=config)
+            edges = []
+            raw_links = st.session_state.graph_data.get('links', [])
+            for l in raw_links:
+                if 'source' in l and 'target' in l:
+                    edges.append(Edge(source=l['source'], target=l['target']))
+
+            # 노드가 존재할 때만 그래프 렌더링
+            if nodes:
+                config = Config(
+                    width=900, 
+                    height=600, 
+                    directed=True, 
+                    physics=True, 
+                    hierarchical=False,
+                    fit_view=True  # 그래프를 화면 중앙에 자동으로 맞춤
+                )
+                selected_id = agraph(nodes=nodes, edges=edges, config=config)
+            else:
+                st.warning("그래프를 생성할 유효한 데이터가 없습니다.")
+                selected_id = None
 
         with col2:
             st.markdown("### 🔍 상세 정보")
             if selected_id:
-                node_detail = next((n for n in st.session_state.graph_data['nodes'] if n['id'] == selected_id), None)
+                # 선택된 노드의 상세 정보 찾기
+                node_detail = next((n for n in st.session_state.graph_data.get('nodes', []) if str(n.get('id')) == str(selected_id)), None)
                 if node_detail:
-                    st.success(f"**명칭:** {node_detail['label']}")
-                    st.info(f"**설명:** {node_detail.get('desc', '설명 없음')}")
+                    st.success(f"**명칭:** {node_detail.get('label', selected_id)}")
+                    st.info(f"**설명:** {node_detail.get('desc', '설명 정보가 없습니다.')}")
+                else:
+                    st.write("상세 정보를 불러올 수 없습니다.")
             else:
-                st.write("💡 노드를 클릭하세요.")
+                st.write("💡 그래프의 노드를 클릭하면 상세 정보가 여기에 표시됩니다.")
 
     st.divider()
 
@@ -113,6 +145,11 @@ if uploaded_files and api_key:
         with st.chat_message("user"):
             st.markdown(prompt)
         with st.chat_message("assistant"):
-            response = model.generate_content(f"문서 통합본: {st.session_state.full_text[:8000]}\n\n질문: {prompt}")
-            st.markdown(response.text)
-            st.session_state.messages.append({"role": "assistant", "content": response.text})
+            with st.spinner("생각 중..."):
+                try:
+                    # 문서 내용과 함께 질문 던지기
+                    response = model.generate_content(f"문서 통합본 내용: {st.session_state.full_text[:8000]}\n\n질문: {prompt}")
+                    st.markdown(response.text)
+                    st.session_state.messages.append({"role": "assistant", "content": response.text})
+                except Exception as e:
+                    st.error(f"채팅 응답 중 오류가 발생했습니다: {e}")
