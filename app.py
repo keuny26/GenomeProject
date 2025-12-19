@@ -2,12 +2,13 @@ import streamlit as st
 import fitz  # PyMuPDF
 import json
 import re
+import time
 import google.generativeai as genai
 from streamlit_agraph import agraph, Node, Edge, Config
 
 # --- 페이지 설정 ---
 st.set_page_config(page_title="GenomeGraph AI", layout="wide")
-st.title("🧬 GenomeGraph AI (Clean Labels)")
+st.title("🧬 GenomeGraph AI (Optimized & Clean View)")
 
 # --- 세션 상태 초기화 (AttributeError 방지) ---
 if "messages" not in st.session_state:
@@ -44,24 +45,41 @@ if api_key:
     except Exception as e:
         st.error(f"API/모델 설정 오류: {e}")
 
-# --- 분석 함수 ---
+# --- 분석 함수 (429 할당량 초과 방지 로직 포함) ---
 def analyze_graph_with_ai(text):
     if not model: return None
+    
+    # 텍스트가 너무 길면 쿼터 소모가 크므로 상위 10,000자만 사용
+    truncated_text = text[:10000] 
+    
     prompt = f"""
-    당신은 전문 유전체 분석가입니다. 제공된 텍스트에서 유전자와 질환 관계를 추출하세요.
+    당신은 전문 유전체 분석가입니다. 제공된 텍스트에서 유전자와 질환 관계를 추출하여 JSON으로 응답하세요.
     1. 모든 노드에 'source_file' 필드를 추가하여 출처를 기록하세요.
     2. 공통 노드는 'source_file'을 "Common"으로 하세요.
     3. 반드시 JSON 형식으로만 응답하세요.
-    텍스트: {text[:20000]}
+    
+    구조 예시:
+    {{
+      "nodes": [{{ "id": "1", "label": "유전자명", "source_file": "파일.pdf", "desc": "설명" }}],
+      "links": [{{ "source": "1", "target": "2" }}]
+    }}
+
+    텍스트: {truncated_text}
     """
     try:
+        # 안전 장치: API 호출 전 1초 지연 (Rate Limit 방지)
+        time.sleep(1) 
+        
         response = model.generate_content(prompt)
         json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
         if json_match:
             return json.loads(json_match.group())
         return None
     except Exception as e:
-        st.error(f"AI 분석 중 오류: {e}")
+        if "429" in str(e):
+            st.error("⚠️ API 호출 한도를 초과했습니다. 1분 후 다시 시도하거나 다른 API 키를 사용해주세요.")
+        else:
+            st.error(f"AI 분석 중 오류: {e}")
         return None
 
 # --- 메인 UI: 다중 파일 업로드 ---
@@ -69,7 +87,7 @@ uploaded_files = st.file_uploader("PDF 보고서들을 업로드하세요", type
 
 if uploaded_files and api_key:
     if st.button("🧬 파일별 통합 분석 시작"):
-        with st.spinner("데이터 분석 중..."):
+        with st.spinner("데이터 분석 중... (할당량 보호를 위해 지연 시간이 발생할 수 있습니다)"):
             combined_text = ""
             for uploaded_file in uploaded_files:
                 doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
@@ -79,7 +97,8 @@ if uploaded_files and api_key:
             st.session_state.full_text = combined_text
             st.session_state.graph_data = analyze_graph_with_ai(st.session_state.full_text)
             st.session_state.messages = [] 
-            st.success("분석이 완료되었습니다!")
+            if st.session_state.graph_data:
+                st.success("분석이 완료되었습니다!")
 
     # 2. 그래프 영역
     if st.session_state.graph_data:
@@ -98,8 +117,7 @@ if uploaded_files and api_key:
                 n_color = color_map.get(src, "#999999")
                 n_size = 35 if src == "Common" else 25
                 
-                # --- ✅ 수정 포인트: [pdf이름] 태그를 삭제하고 순수 이름만 표시 ---
-                # 공통 노드일 때만 구분을 위해 별표(⭐)를 유지하고, 아니면 레이블 그대로 사용
+                # ✅ 레이블에서 [pdf이름]을 제거하고 순수 이름만 표시 (공통 노드만 ⭐ 표시)
                 clean_label = f"⭐ {n.get('label')}" if src == "Common" else n.get('label')
                 
                 nodes.append(Node(id=n['id'], label=clean_label, size=n_size, color=n_color))
@@ -113,7 +131,7 @@ if uploaded_files and api_key:
                 if st.button("🎯 그래프 중앙 정렬"):
                     st.rerun()
             else:
-                st.warning("분석 결과가 없습니다.")
+                st.warning("분석 결과 노드가 생성되지 않았습니다.")
                 selected_id = None
 
         with col2:
@@ -143,6 +161,7 @@ if uploaded_files and api_key:
             st.markdown(prompt)
         with st.chat_message("assistant"):
             try:
+                # 채팅 시에도 타임아웃 방지 위해 텍스트 길이 조절
                 res = model.generate_content(f"내용 요약: {st.session_state.full_text[:8000]}\n질문: {prompt}")
                 st.markdown(res.text)
                 st.session_state.messages.append({"role": "assistant", "content": res.text})
