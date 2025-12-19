@@ -7,7 +7,7 @@ from streamlit_agraph import agraph, Node, Edge, Config
 
 # --- 페이지 설정 ---
 st.set_page_config(page_title="GenomeGraph AI", layout="wide")
-st.title("🧬 GenomeGraph AI (Multi-PDF Support)")
+st.title("🧬 GenomeGraph AI (Smart Integration)")
 
 # --- API 키 설정 ---
 if "GEMINI_API_KEY" in st.secrets:
@@ -37,12 +37,8 @@ if api_key:
 def analyze_graph_with_ai(text):
     if not model: return None
     prompt = f"""
-    당신은 유전체 분석가입니다. 제공된 텍스트(여러 문서 통합본)에서 유전자와 질환 관계를 추출하여 JSON으로만 응답하세요.
-    형식:
-    {{
-      "nodes": [{{ "id": "ID", "label": "이름", "type": "gene/disease", "desc": "상세 분석" }}],
-      "links": [{{ "source": "ID", "target": "ID" }}]
-    }}
+    유전체 분석가로서 텍스트에서 유전자와 질환 관계를 추출해 JSON으로만 답하세요. 
+    반드시 'nodes'와 'links'를 포함하고 각 노드에 'desc'를 넣으세요.
     텍스트: {text[:15000]}
     """
     try:
@@ -51,13 +47,16 @@ def analyze_graph_with_ai(text):
         return json.loads(json_match.group()) if json_match else None
     except: return None
 
-# --- 메인 UI: accept_multiple_files=True 추가 ---
-uploaded_files = st.file_uploader("PDF 보고서들을 업로드하세요 (여러 개 가능)", type="pdf", accept_multiple_files=True)
+# --- 메인 UI: 다중 파일 업로드 ---
+uploaded_files = st.file_uploader("PDF 보고서들을 업로드하세요", type="pdf", accept_multiple_files=True)
+
+# 핵심 변경 사항: 업로드된 파일들의 이름 리스트를 추적하여 변경 감지
+current_file_names = [f.name for f in uploaded_files] if uploaded_files else []
 
 if uploaded_files and api_key:
-    # 1. 여러 PDF에서 텍스트 통합 추출
-    if "full_text" not in st.session_state or len(uploaded_files) != st.session_state.get("file_count", 0):
-        with st.spinner(f"{len(uploaded_files)}개의 파일 분석 중..."):
+    # 파일 구성이 바뀌면(새 파일 추가/삭제) 세션 강제 초기화
+    if "last_files" not in st.session_state or st.session_state.last_files != current_file_names:
+        with st.spinner("새로운 파일을 포함하여 통합 분석 중..."):
             combined_text = ""
             for uploaded_file in uploaded_files:
                 doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
@@ -65,21 +64,30 @@ if uploaded_files and api_key:
                 combined_text += " ".join([page.get_text() for page in doc])
             
             st.session_state.full_text = combined_text
-            st.session_state.file_count = len(uploaded_files)
+            st.session_state.last_files = current_file_names  # 파일 리스트 업데이트
             st.session_state.graph_data = analyze_graph_with_ai(st.session_state.full_text)
             st.session_state.messages = []
 
-    # 2. 그래프 및 상세 정보 레이아웃
+    # 2. 그래프 영역
     if st.session_state.get("graph_data"):
         st.subheader("🧬 통합 지식 그래프")
+        
         col1, col2 = st.columns([3, 1])
         
         with col1:
-            nodes = [Node(id=n['id'], label=n['label'], size=20, color=('#4285F4' if n.get('type') == 'gene' else '#EA4335')) 
+            nodes = [Node(id=n['id'], label=n['label'], size=25, color=('#4285F4' if n.get('type') == 'gene' else '#EA4335')) 
                      for n in st.session_state.graph_data.get('nodes', [])]
             edges = [Edge(source=l['source'], target=l['target']) for l in st.session_state.graph_data.get('links', [])]
             
-            config = Config(width=800, height=500, directed=True, physics=True)
+            # 그래프 설정 개선 (중앙 정렬 및 물리 엔진 최적화)
+            config = Config(
+                width=900, 
+                height=600, 
+                directed=True, 
+                physics=True, 
+                hierarchical=False, # 유전체 관계는 계층보다 네트워크 형태가 적합
+                fit_view=True       # 그래프를 화면 중앙에 자동으로 맞춤
+            )
             selected_id = agraph(nodes=nodes, edges=edges, config=config)
 
         with col2:
@@ -88,25 +96,23 @@ if uploaded_files and api_key:
                 node_detail = next((n for n in st.session_state.graph_data['nodes'] if n['id'] == selected_id), None)
                 if node_detail:
                     st.success(f"**명칭:** {node_detail['label']}")
-                    st.info(f"**설명:** {node_detail.get('desc', '상세 설명 없음')}")
+                    st.info(f"**설명:** {node_detail.get('desc', '설명 없음')}")
             else:
                 st.write("💡 노드를 클릭하세요.")
 
     st.divider()
 
-    # 3. AI 채팅창
+    # 3. 채팅 영역
     st.subheader("💬 통합 분석 채팅")
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    if prompt := st.chat_input("여러 문서의 공통점이나 차이점을 물어보세요."):
+    if prompt := st.chat_input("질문하세요."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
-
         with st.chat_message("assistant"):
-            with st.spinner("답변 생성 중..."):
-                response = model.generate_content(f"여러 문서 통합 내용: {st.session_state.full_text[:10000]}\n\n질문: {prompt}")
-                st.markdown(response.text)
-                st.session_state.messages.append({"role": "assistant", "content": response.text})
+            response = model.generate_content(f"문서 통합본: {st.session_state.full_text[:8000]}\n\n질문: {prompt}")
+            st.markdown(response.text)
+            st.session_state.messages.append({"role": "assistant", "content": response.text})
