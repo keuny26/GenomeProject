@@ -9,12 +9,13 @@ from Bio import Entrez  # NCBI 연동용
 
 # --- 1. 페이지 설정 ---
 st.set_page_config(page_title="GenomeGraph AI", layout="wide")
-st.title("🧬 GenomeGraph AI (Stable & Full-Featured)")
+st.title("🧬 GenomeGraph AI (Universal Compatibility)")
 
 # --- 2. 세션 상태 초기화 ---
 if "messages" not in st.session_state: st.session_state.messages = []
 if "full_text" not in st.session_state: st.session_state.full_text = ""
 if "graph_data" not in st.session_state: st.session_state.graph_data = None
+if "active_model_name" not in st.session_state: st.session_state.active_model_name = None
 
 # --- 3. API 키 및 설정 (사이드바) ---
 with st.sidebar:
@@ -31,14 +32,29 @@ with st.sidebar:
         for key in list(st.session_state.keys()): del st.session_state[key]
         st.rerun()
 
-# --- 4. 모델 설정 (404 에러 방어 핵심) ---
+# --- 4. 모델 자동 감지 로직 (404 에러 방지 핵심) ---
 model = None
 if api_key:
     try:
         genai.configure(api_key=api_key)
-        # v1beta 404 에러를 방지하기 위해 표준 모델명 사용
-        model = genai.GenerativeModel(model_name='gemini-1.5-flash')
-        st.sidebar.success("✅ Gemini 모델 연결됨")
+        
+        # [핵심] 사용 가능한 모델 리스트를 가져와서 404 방지
+        # v1beta가 아닌 작동 가능한 실제 모델 경로를 찾습니다.
+        available_models = [
+            m.name for m in genai.list_models() 
+            if 'generateContent' in m.supported_generation_methods
+        ]
+        
+        # 우선순위: gemini-1.5-flash -> gemini-1.5-pro -> gemini-1.0-pro
+        priority = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"]
+        target = next((m for p in priority for m in available_models if p in m), None)
+        
+        if target:
+            model = genai.GenerativeModel(model_name=target)
+            st.session_state.active_model_name = target
+            st.sidebar.success(f"✅ 연결됨: {target}")
+        else:
+            st.sidebar.error("사용 가능한 모델을 찾을 수 없습니다.")
     except Exception as e:
         st.error(f"모델 설정 오류: {e}")
 
@@ -109,12 +125,11 @@ if uploaded_files and api_key:
                 st.session_state.graph_data = merge_graphs(all_results)
                 st.success("분석 완료!")
 
-    # --- 7. 그래프 필터링 및 시각화 (기능 복구) ---
+    # --- 7. 그래프 필터링 및 시각화 (기능 유지) ---
     if st.session_state.graph_data:
         st.sidebar.divider()
         st.sidebar.subheader("🔍 그래프 필터 및 검색")
         
-        # 필터링 기능 복구
         all_types = list(set([n.get('type', 'Unknown') for n in st.session_state.graph_data['nodes']]))
         selected_types = st.sidebar.multiselect("표시할 타입", all_types, default=all_types)
         search_query = st.sidebar.text_input("🎯 노드 검색 (이름)")
@@ -134,14 +149,18 @@ if uploaded_files and api_key:
             for n in st.session_state.graph_data['nodes']:
                 if n.get('type') in selected_types and search_query.lower() in n.get('label', '').lower():
                     src = n.get('source_file', 'Unknown')
-                    f_nodes.append(Node(id=n['id'], label=n['label'], size=25 if src=="Common" else 20, color=color_map.get(src, "#999999")))
+                    f_nodes.append(Node(id=n['id'], 
+                                       label=n['label'], 
+                                       size=25 if src=="Common" else 20, 
+                                       color=color_map.get(src, "#999999")))
                     f_node_ids.add(n['id'])
             
             f_edges = [Edge(source=l['source'], target=l['target']) for l in st.session_state.graph_data['links'] 
                        if l['source'] in f_node_ids and l['target'] in f_node_ids]
 
             if f_nodes:
-                selected_id = agraph(nodes=f_nodes, edges=f_edges, config=Config(width=900, height=600, directed=True, physics=True))
+                config = Config(width=900, height=600, directed=True, physics=True)
+                selected_id = agraph(nodes=f_nodes, edges=f_edges, config=config)
 
         with col2:
             st.markdown("### 🎨 범례 및 상세")
@@ -156,7 +175,7 @@ if uploaded_files and api_key:
                     st.info(f"**타입:** {node['type']} | **출처:** {node.get('source_file')}")
                     if node['type'] == "Gene":
                         with st.spinner("NCBI 확인 중..."):
-                            st.caption(f"**NCBI Summary:** {get_ncbi_gene_info(node['label'], ncbi_email)}")
+                            st.caption(f"**NCBI:** {get_ncbi_gene_info(node['label'], ncbi_email)}")
                         st.link_button("🧬 NCBI 상세보기", f"https://www.ncbi.nlm.nih.gov/gene/?term={node['label']}")
                     st.write(f"**상세 설명:**\n{node.get('desc', '내용 없음')}")
             else:
