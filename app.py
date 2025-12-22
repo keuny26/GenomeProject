@@ -5,134 +5,157 @@ import re
 import time
 import google.generativeai as genai
 from streamlit_agraph import agraph, Node, Edge, Config
+from Bio import Entrez  # NCBI 연동용
 
-# --- 페이지 설정 ---
+# --- 1. 페이지 설정 ---
 st.set_page_config(page_title="GenomeGraph AI", layout="wide")
-st.title("🧬 GenomeGraph AI (Optimized & Clean View)")
+st.title("🧬 GenomeGraph AI (Full Version: Multi-Doc Intelligence)")
 
-# --- 세션 상태 초기화 (AttributeError 방지) ---
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "full_text" not in st.session_state:
-    st.session_state.full_text = ""
-if "graph_data" not in st.session_state:
-    st.session_state.graph_data = None
+# --- 2. 세션 상태 초기화 ---
+if "messages" not in st.session_state: st.session_state.messages = []
+if "full_text" not in st.session_state: st.session_state.full_text = ""
+if "graph_data" not in st.session_state: st.session_state.graph_data = None
 
-# --- API 키 설정 ---
-if "GEMINI_API_KEY" in st.secrets:
-    api_key = st.secrets["GEMINI_API_KEY"]
-else:
-    st.sidebar.title("설정")
-    api_key = st.sidebar.text_input("Gemini API Key를 입력하세요", type="password")
+# --- 3. API 키 및 설정 (사이드바) ---
+with st.sidebar:
+    st.title("⚙️ 설정 및 보안")
+    if "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
+        st.info("✅ Secrets에서 API 키를 로드했습니다.")
+    else:
+        api_key = st.text_input("Gemini API Key", type="password", help="키는 세션 종료 시 삭제됩니다.")
+    
+    ncbi_email = st.text_input("NCBI 연동용 이메일", value="your_email@example.com")
+    
+    if st.button("🗑️ 모든 데이터 초기화"):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
 
-# --- 모델 초기화 (자동 감지 로직) ---
+# --- 4. 모델 및 NCBI 함수 ---
 model = None
 if api_key:
     try:
         genai.configure(api_key=api_key)
-        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        target_model_name = 'models/gemini-1.5-flash'
-        
-        if target_model_name in available_models:
-            model = genai.GenerativeModel('gemini-1.5-flash')
-        elif available_models:
-            fallback = available_models[0].replace('models/', '')
-            model = genai.GenerativeModel(fallback)
-            st.sidebar.warning(f"Flash 모델 미지원으로 {fallback} 모델에 연결되었습니다.")
-        
-        if model:
-            st.sidebar.success(f"연결됨: {model.model_name}")
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        st.sidebar.success("모델 연결됨: gemini-1.5-flash")
     except Exception as e:
-        st.error(f"API/모델 설정 오류: {e}")
+        st.error(f"모델 설정 오류: {e}")
 
-# --- 분석 함수 (429 할당량 초과 방지 로직 포함) ---
-def analyze_graph_with_ai(text):
+def get_ncbi_gene_info(gene_name, email):
+    Entrez.email = email
+    try:
+        search_handle = Entrez.esearch(db="gene", term=f"{gene_name}[Gene Name] AND human[Organism]")
+        search_results = Entrez.read(search_handle)
+        if not search_results["IdList"]: return "NCBI 정보를 찾을 수 없습니다."
+        gene_id = search_results["IdList"][0]
+        summary_handle = Entrez.esummary(db="gene", id=gene_id)
+        summary_record = Entrez.read(summary_handle)
+        return summary_record['DocumentSummarySet']['DocumentSummary'][0]['Description']
+    except: return "NCBI 데이터 로드 실패"
+
+# --- 5. 분석 및 병합 로직 (핵심 해결책) ---
+def analyze_single_doc(text, filename):
+    """문서 한 개씩 정밀하게 분석하여 데이터 누락을 방지합니다."""
     if not model: return None
-    
-    # 텍스트가 너무 길면 쿼터 소모가 크므로 상위 10,000자만 사용
-    truncated_text = text[:10000] 
-    
+    # 보안: 개인정보 마스킹
+    clean_text = re.sub(r'\d{3}-\d{4}-\d{4}', "[PROTECTED]", text)
     prompt = f"""
-    당신은 전문 유전체 분석가입니다. 제공된 텍스트에서 유전자와 질환 관계를 추출하여 JSON으로 응답하세요.
-    1. 모든 노드에 'source_file' 필드를 추가하여 출처를 기록하세요.
-    2. 공통 노드는 'source_file'을 "Common"으로 하세요.
-    3. 반드시 JSON 형식으로만 응답하세요.
-    
-    구조 예시:
-    {{
-      "nodes": [{{ "id": "1", "label": "유전자명", "source_file": "파일.pdf", "desc": "설명" }}],
-      "links": [{{ "source": "1", "target": "2" }}]
-    }}
-
-    텍스트: {truncated_text}
+    당신은 전문 유전체 분석가입니다. 다음 텍스트에서 유전자, 질환(증상 포함), 변이 관계를 추출하여 JSON으로 응답하세요.
+    - 증상/질병은 반드시 'type': 'Disease'로 분류하세요.
+    - 출력 형식: {{"nodes": [{{"id": "ID", "label": "이름", "type": "Gene/Disease/Variant/Drug", "desc": "설명"}}], "links": [{{"source": "ID", "target": "ID"}}]}}
+    텍스트: {clean_text[:10000]}
     """
     try:
-        # 안전 장치: API 호출 전 1초 지연 (Rate Limit 방지)
-        time.sleep(1) 
-        
+        time.sleep(1) # 할당량 관리
         response = model.generate_content(prompt)
         json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
         if json_match:
-            return json.loads(json_match.group())
+            data = json.loads(json_match.group())
+            for n in data['nodes']: n['source_file'] = filename
+            return data
         return None
     except Exception as e:
-        if "429" in str(e):
-            st.error("⚠️ API 호출 한도를 초과했습니다. 1분 후 다시 시도하거나 다른 API 키를 사용해주세요.")
-        else:
-            st.error(f"AI 분석 중 오류: {e}")
+        st.error(f"{filename} 분석 오류: {e}")
         return None
 
-# --- 메인 UI: 다중 파일 업로드 ---
+def merge_graphs(results):
+    """여러 문서의 분석 결과를 지능적으로 합칩니다."""
+    merged_nodes = {}
+    merged_links = []
+    for data in results:
+        if not data: continue
+        for n in data['nodes']:
+            nid = n['id']
+            if nid in merged_nodes:
+                # 여러 문서에서 발견되면 'Common'으로 표시
+                merged_nodes[nid]['source_file'] = "Common"
+            else:
+                merged_nodes[nid] = n
+        merged_links.extend(data['links'])
+    
+    # 중복 링크 제거
+    unique_links = [dict(t) for t in {tuple(sorted(d.items())) for d in merged_links}]
+    return {"nodes": list(merged_nodes.values()), "links": unique_links}
+
+# --- 6. UI: 파일 업로드 및 분석 ---
 uploaded_files = st.file_uploader("PDF 보고서들을 업로드하세요", type="pdf", accept_multiple_files=True)
 
 if uploaded_files and api_key:
-    if st.button("🧬 파일별 통합 분석 시작"):
-        with st.spinner("데이터 분석 중... (할당량 보호를 위해 지연 시간이 발생할 수 있습니다)"):
-            combined_text = ""
+    if st.button("🧬 파일 통합 분석 시작 (누락 방지 모드)"):
+        all_results = []
+        with st.spinner("문서별로 개별 분석을 진행 중입니다..."):
+            full_text_accumulator = ""
             for uploaded_file in uploaded_files:
                 doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-                combined_text += f"\n\n[Document: {uploaded_file.name}]\n"
-                combined_text += " ".join([page.get_text() for page in doc])
+                text = " ".join([page.get_text() for page in doc])
+                full_text_accumulator += f"\n\n[Document: {uploaded_file.name}]\n{text}"
+                
+                # 개별 분석 실행
+                res = analyze_single_doc(text, uploaded_file.name)
+                all_results.append(res)
             
-            st.session_state.full_text = combined_text
-            st.session_state.graph_data = analyze_graph_with_ai(st.session_state.full_text)
-            st.session_state.messages = [] 
-            if st.session_state.graph_data:
-                st.success("분석이 완료되었습니다!")
+            st.session_state.full_text = full_text_accumulator
+            st.session_state.graph_data = merge_graphs(all_results)
+            st.session_state.messages = []
+            st.success("모든 문서 분석 및 통합 완료!")
 
-    # 2. 그래프 영역
+    # --- 7. 그래프 시각화 및 필터 영역 ---
     if st.session_state.graph_data:
-        st.subheader("🧬 출처별 통합 지식 그래프")
+        st.sidebar.divider()
+        st.sidebar.subheader("💾 데이터 내보내기")
+        export_json = json.dumps(st.session_state.graph_data, indent=2, ensure_ascii=False)
+        st.sidebar.download_button("JSON 다운로드", export_json, "genome_graph.json", "application/json")
+
+        st.sidebar.subheader("🔍 필터링")
+        all_types = list(set([n.get('type', 'Unknown') for n in st.session_state.graph_data['nodes']]))
+        selected_types = st.sidebar.multiselect("노드 타입", all_types, default=all_types)
+        search_query = st.sidebar.text_input("🎯 노드 검색")
+
         col1, col2 = st.columns([3, 1])
         
+        # 색상 설정
         file_names = [f.name for f in uploaded_files]
         color_palette = ["#4285F4", "#34A853", "#FBBC05", "#8E44AD", "#F39C12", "#16A085"]
         color_map = {name: color_palette[i % len(color_palette)] for i, name in enumerate(file_names)}
         color_map["Common"] = "#EA4335" 
 
         with col1:
-            nodes = []
-            for n in st.session_state.graph_data.get('nodes', []):
-                src = n.get('source_file', 'Unknown')
-                n_color = color_map.get(src, "#999999")
-                n_size = 35 if src == "Common" else 25
-                
-                # ✅ 레이블에서 [pdf이름]을 제거하고 순수 이름만 표시 (공통 노드만 ⭐ 표시)
-                clean_label = f"⭐ {n.get('label')}" if src == "Common" else n.get('label')
-                
-                nodes.append(Node(id=n['id'], label=clean_label, size=n_size, color=n_color))
+            filtered_nodes = []
+            filtered_node_ids = set()
+            for n in st.session_state.graph_data['nodes']:
+                if n.get('type') in selected_types and search_query.lower() in n.get('label', '').lower():
+                    src = n.get('source_file', 'Unknown')
+                    n_color = color_map.get(src, "#999999")
+                    is_common = src == "Common"
+                    filtered_nodes.append(Node(id=n['id'], label=f"⭐ {n['label']}" if is_common else n['label'], size=35 if is_common else 25, color=n_color))
+                    filtered_node_ids.add(n['id'])
             
-            edges = [Edge(source=l['source'], target=l['target']) for l in st.session_state.graph_data.get('links', [])]
+            filtered_edges = [Edge(source=l['source'], target=l['target']) for l in st.session_state.graph_data['links'] if l['source'] in filtered_node_ids and l['target'] in filtered_node_ids]
 
-            if nodes:
+            if filtered_nodes:
                 config = Config(width=900, height=600, directed=True, physics=True, fit_view=True, panAndZoom=True)
-                selected_id = agraph(nodes=nodes, edges=edges, config=config)
-                
-                if st.button("🎯 그래프 중앙 정렬"):
-                    st.rerun()
-            else:
-                st.warning("분석 결과 노드가 생성되지 않았습니다.")
-                selected_id = None
+                selected_id = agraph(nodes=filtered_nodes, edges=filtered_edges, config=config)
 
         with col2:
             st.markdown("### 🎨 범례 및 상세 정보")
@@ -143,27 +166,27 @@ if uploaded_files and api_key:
             if selected_id:
                 node_detail = next((n for n in st.session_state.graph_data['nodes'] if str(n['id']) == str(selected_id)), None)
                 if node_detail:
-                    st.success(f"**명칭:** {node_detail.get('label')}")
-                    st.info(f"**출처:** {node_detail.get('source_file')}")
-                    st.write(f"**분석 상세:**\n{node_detail.get('desc', '설명 없음')}")
+                    st.success(f"**명칭:** {node_detail['label']} ({node_detail['type']})")
+                    st.info(f"**출처:** {node_detail['source_file']}")
+                    if node_detail['type'] == "Gene":
+                        with st.spinner("NCBI 확인 중..."):
+                            st.caption(f"**NCBI Summary:** {get_ncbi_gene_info(node_detail['label'], ncbi_email)}")
+                    
+                    st.link_button("🧬 NCBI 바로가기", f"https://www.ncbi.nlm.nih.gov/gene/?term={node_detail['label']}")
+                    st.write(f"**AI 분석 상세:**\n{node_detail.get('desc', '설명 없음')}")
 
-    st.divider()
+# --- 8. 채팅 영역 ---
+st.divider()
+st.subheader("💬 데이터 보안 채팅")
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]): st.markdown(message["content"])
 
-    # 3. 채팅 영역
-    st.subheader("💬 통합 분석 채팅")
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    if prompt := st.chat_input("질문하세요."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        with st.chat_message("assistant"):
-            try:
-                # 채팅 시에도 타임아웃 방지 위해 텍스트 길이 조절
-                res = model.generate_content(f"내용 요약: {st.session_state.full_text[:8000]}\n질문: {prompt}")
-                st.markdown(res.text)
-                st.session_state.messages.append({"role": "assistant", "content": res.text})
-            except Exception as e:
-                st.error(f"오류: {e}")
+if chat_prompt := st.chat_input("데이터에 대해 질문하세요."):
+    st.session_state.messages.append({"role": "user", "content": chat_prompt})
+    with st.chat_message("user"): st.markdown(chat_prompt)
+    with st.chat_message("assistant"):
+        try:
+            res = model.generate_content(f"Context: {st.session_state.full_text[:8000]}\nQuestion: {chat_prompt}")
+            st.markdown(res.text)
+            st.session_state.messages.append({"role": "assistant", "content": res.text})
+        except Exception as e: st.error(f"오류: {e}")
