@@ -19,7 +19,6 @@ if "graph_data" not in st.session_state: st.session_state.graph_data = None
 # --- 3. API 키 및 설정 (사이드바) ---
 with st.sidebar:
     st.title("⚙️ 설정 및 보안")
-    # GitHub Secrets 사용 권장
     if "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
         st.info("✅ Secrets에서 API 키를 로드했습니다.")
@@ -33,12 +32,12 @@ with st.sidebar:
             del st.session_state[key]
         st.rerun()
 
-# --- 4. 모델 및 NCBI 함수 ---
+# --- 4. 모델 및 NCBI 함수 (404 에러 방어) ---
 model = None
 if api_key:
     try:
         genai.configure(api_key=api_key)
-        # 404 에러 방지: 모델 이름만 명확히 전달
+        # 404 방지: 'models/' 접두어 없이 모델명만 사용하거나, 최신 배포판 명칭 사용
         model = genai.GenerativeModel(model_name='gemini-1.5-flash')
         st.sidebar.success("모델 연결됨: gemini-1.5-flash")
     except Exception as e:
@@ -59,7 +58,7 @@ def get_ncbi_gene_info(gene_name, email):
 # --- 5. 분석 및 병합 로직 ---
 def analyze_single_doc(text, filename):
     if not model: return None
-    # 보안: 개인정보 마스킹 (전화번호 형태 등)
+    # 보안: 개인정보 마스킹
     clean_text = re.sub(r'\d{3}-\d{4}-\d{4}', "[PROTECTED]", text)
     
     prompt = f"""
@@ -70,32 +69,35 @@ def analyze_single_doc(text, filename):
     """
     
     try:
-        time.sleep(1) # API 할당량 관리
+        time.sleep(1.5) # API Rate Limit 방지
         response = model.generate_content(prompt)
-        # JSON 블록만 추출
+        # JSON 블록 추출 로직 강화
         json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group())
             # 노드별 출처 정보 기록
-            for n in data.get('nodes', []): n['source_file'] = filename
+            if 'nodes' in data:
+                for n in data['nodes']: n['source_file'] = filename
             return data
         return None
     except Exception as e:
-        st.error(f"{filename} 분석 중 오류 발생: {e}")
+        # 404 등 구체적인 에러 메시지 캡처
+        st.warning(f"[{filename}] 분석 도중 에러가 발생했습니다: {e}")
         return None
 
 def merge_graphs(results):
     merged_nodes = {}
     merged_links = []
     for data in results:
-        if not data: continue
-        for n in data.get('nodes', []):
+        if not data or 'nodes' not in data: continue
+        for n in data['nodes']:
             nid = n['id']
             if nid in merged_nodes:
                 merged_nodes[nid]['source_file'] = "Common"
             else:
                 merged_nodes[nid] = n
-        merged_links.extend(data.get('links', []))
+        if 'links' in data:
+            merged_links.extend(data['links'])
     
     # 중복 링크 제거
     unique_links = [dict(t) for t in {tuple(sorted(d.items())) for d in merged_links}]
@@ -110,17 +112,23 @@ if uploaded_files and api_key:
         with st.spinner("문서별 정밀 분석 진행 중..."):
             full_text_accumulator = ""
             for uploaded_file in uploaded_files:
-                doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-                text = " ".join([page.get_text() for page in doc])
-                full_text_accumulator += f"\n\n[Document: {uploaded_file.name}]\n{text}"
-                
-                res = analyze_single_doc(text, uploaded_file.name)
-                all_results.append(res)
+                try:
+                    doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+                    text = " ".join([page.get_text() for page in doc])
+                    full_text_accumulator += f"\n\n[Document: {uploaded_file.name}]\n{text}"
+                    
+                    res = analyze_single_doc(text, uploaded_file.name)
+                    if res: all_results.append(res)
+                except Exception as e:
+                    st.error(f"{uploaded_file.name} 읽기 실패: {e}")
             
-            st.session_state.full_text = full_text_accumulator
-            st.session_state.graph_data = merge_graphs(all_results)
-            st.session_state.messages = []
-            st.success("통합 분석 완료!")
+            if all_results:
+                st.session_state.full_text = full_text_accumulator
+                st.session_state.graph_data = merge_graphs(all_results)
+                st.session_state.messages = []
+                st.success("통합 분석 완료!")
+            else:
+                st.error("분석 결과가 없습니다. API 설정을 확인하세요.")
 
     # --- 7. 그래프 시각화 영역 ---
     if st.session_state.graph_data:
@@ -132,7 +140,7 @@ if uploaded_files and api_key:
 
         col1, col2 = st.columns([3, 1])
         
-        # NameError 방지: selected_id 초기화
+        # NameError 방지: 변수 초기화
         selected_id = None
         
         # 파일별 컬러 맵핑
@@ -145,10 +153,13 @@ if uploaded_files and api_key:
             filtered_nodes = []
             filtered_node_ids = set()
             for n in st.session_state.graph_data['nodes']:
-                if n.get('type') in selected_types and search_query.lower() in n.get('label', '').lower():
+                is_type_match = n.get('type') in selected_types
+                is_search_match = search_query.lower() in n.get('label', '').lower()
+                
+                if is_type_match and is_search_match:
                     src = n.get('source_file', 'Unknown')
                     n_color = color_map.get(src, "#999999")
-                    is_common = src == "Common"
+                    is_common = (src == "Common")
                     filtered_nodes.append(Node(id=n['id'], 
                                                label=f"⭐ {n['label']}" if is_common else n['label'], 
                                                size=35 if is_common else 25, 
@@ -162,6 +173,8 @@ if uploaded_files and api_key:
             if filtered_nodes:
                 config = Config(width=900, height=600, directed=True, physics=True, fit_view=True)
                 selected_id = agraph(nodes=filtered_nodes, edges=filtered_edges, config=config)
+            else:
+                st.info("필터링 조건에 맞는 데이터가 없습니다.")
 
         with col2:
             st.markdown("### 🎨 범례")
@@ -169,6 +182,7 @@ if uploaded_files and api_key:
                 st.markdown(f"<span style='color:{color}'>●</span> **{src}**", unsafe_allow_html=True)
             
             st.divider()
+            # selected_id가 있을 때만 상세 정보 표시 (에러 방지 핵심)
             if selected_id:
                 node_detail = next((n for n in st.session_state.graph_data['nodes'] if str(n['id']) == str(selected_id)), None)
                 if node_detail:
@@ -176,7 +190,7 @@ if uploaded_files and api_key:
                     st.info(f"**타입:** {node_detail['type']} | **출처:** {node_detail.get('source_file')}")
                     
                     if node_detail['type'] == "Gene":
-                        with st.spinner("NCBI 데이터 검색 중..."):
+                        with st.spinner("NCBI 검색 중..."):
                             ncbi_info = get_ncbi_gene_info(node_detail['label'], ncbi_email)
                             st.caption(f"**NCBI Summary:** {ncbi_info}")
                     
@@ -188,19 +202,18 @@ if uploaded_files and api_key:
 # --- 8. 채팅 영역 ---
 if st.session_state.full_text:
     st.divider()
-    st.subheader("💬 분석 데이터 기반 Q&A")
+    st.subheader("💬 통합 데이터 기반 Q&A")
     for message in st.session_state.messages:
         with st.chat_message(message["role"]): st.markdown(message["content"])
 
-    if chat_prompt := st.chat_input("이 유전체 데이터들에 대해 질문하세요."):
+    if chat_prompt := st.chat_input("분석된 유전체 데이터에 대해 질문하세요."):
         st.session_state.messages.append({"role": "user", "content": chat_prompt})
         with st.chat_message("user"): st.markdown(chat_prompt)
         
         with st.chat_message("assistant"):
             try:
-                # 404 방지를 위해 초기화된 model 객체 사용
                 res = model.generate_content(f"Context: {st.session_state.full_text[:10000]}\nQuestion: {chat_prompt}")
                 st.markdown(res.text)
                 st.session_state.messages.append({"role": "assistant", "content": res.text})
             except Exception as e:
-                st.error(f"채팅 응답 오류: {e}")
+                st.error(f"채팅 오류: {e}")
