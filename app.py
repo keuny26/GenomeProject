@@ -32,32 +32,40 @@ with st.sidebar:
         for key in list(st.session_state.keys()): del st.session_state[key]
         st.rerun()
 
-# --- 4. 모델 자동 감지 로직 (404 에러 방지 핵심) ---
+# --- 4. 모델 설정 (진단 및 강제 우회 통합) ---
 model = None
 if api_key:
     try:
         genai.configure(api_key=api_key)
         
-        # [핵심] 사용 가능한 모델 리스트를 가져와서 404 방지
-        # v1beta가 아닌 작동 가능한 실제 모델 경로를 찾습니다.
-        available_models = [
-            m.name for m in genai.list_models() 
-            if 'generateContent' in m.supported_generation_methods
-        ]
+        # [진단] 현재 이 API 키로 접근 가능한 모든 모델 리스트 출력
+        # 404 에러의 원인을 찾기 위해 전체 목록을 먼저 스캔합니다.
+        all_models = [m.name for m in genai.list_models()]
+        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         
-        # 우선순위: gemini-1.5-flash -> gemini-1.5-pro -> gemini-1.0-pro
-        priority = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"]
-        target = next((m for p in priority for m in available_models if p in m), None)
-        
-        if target:
+        if not available_models:
+            st.sidebar.error("❌ 접근 가능한 모델이 0개입니다.")
+            st.sidebar.info(f"전체 모델 리스트: {all_models}")
+            
+            # [최후의 수단] 리스트에 없어도 강제로 이름을 지정하여 시도 (SDK 버그 우회)
+            st.sidebar.warning("⚠️ 강제 연결 모드 진입: gemini-1.5-flash")
+            model = genai.GenerativeModel(model_name='gemini-1.5-flash')
+            st.session_state.active_model_name = "gemini-1.5-flash (Forced)"
+        else:
+            # 정상적인 경우 우선순위에 따라 선택 (1.5 Flash 선호)
+            target = next((m for m in available_models if "gemini-1.5-flash" in m), available_models[0])
             model = genai.GenerativeModel(model_name=target)
             st.session_state.active_model_name = target
-            st.sidebar.success(f"✅ 연결됨: {target}")
-        else:
-            st.sidebar.error("사용 가능한 모델을 찾을 수 없습니다.")
+            st.sidebar.success(f"✅ 연결 성공: {target}")
+            
     except Exception as e:
-        st.error(f"모델 설정 오류: {e}")
+        st.error(f"❌ API 접근 오류 발생: {e}")
+        if "API_KEY_INVALID" in str(e):
+            st.info("💡 API 키가 유효하지 않습니다. AI Studio에서 키를 새로 생성해 보세요.")
+        elif "PERMISSION_DENIED" in str(e):
+            st.info("💡 권한 거부: Google Cloud Console에서 'Generative Language API'가 활성화되었는지 확인하세요.")
 
+# --- 5. 분석 및 병합 로직 (기능 유지) ---
 def get_ncbi_gene_info(gene_name, email):
     Entrez.email = email
     try:
@@ -70,7 +78,6 @@ def get_ncbi_gene_info(gene_name, email):
         return summary_record['DocumentSummarySet']['DocumentSummary'][0]['Description']
     except: return "NCBI 데이터 로드 실패"
 
-# --- 5. 분석 및 병합 로직 ---
 def analyze_single_doc(text, filename):
     if not model: return None
     clean_text = re.sub(r'\d{3}-\d{4}-\d{4}', "[PROTECTED]", text)
@@ -80,7 +87,7 @@ def analyze_single_doc(text, filename):
     텍스트: {clean_text[:10000]}
     """
     try:
-        time.sleep(1.2) # API 할당량 보호
+        time.sleep(1.2)
         response = model.generate_content(prompt)
         json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
         if json_match:
@@ -93,8 +100,7 @@ def analyze_single_doc(text, filename):
     return None
 
 def merge_graphs(results):
-    merged_nodes = {}
-    merged_links = []
+    merged_nodes, merged_links = {}, []
     for data in results:
         if not data or 'nodes' not in data: continue
         for n in data['nodes']:
@@ -111,7 +117,7 @@ uploaded_files = st.file_uploader("PDF 보고서 업로드 (다중 선택 가능
 if uploaded_files and api_key:
     if st.button("🧬 통합 분석 시작"):
         all_results = []
-        with st.spinner("문서별 정밀 분석 중..."):
+        with st.spinner(f"{st.session_state.active_model_name} 엔진으로 분석 중..."):
             full_txt = ""
             for f in uploaded_files:
                 doc = fitz.open(stream=f.read(), filetype="pdf")
@@ -125,11 +131,10 @@ if uploaded_files and api_key:
                 st.session_state.graph_data = merge_graphs(all_results)
                 st.success("분석 완료!")
 
-    # --- 7. 그래프 필터링 및 시각화 (기능 유지) ---
+    # --- 7. 그래프 필터링 및 시직화 ---
     if st.session_state.graph_data:
         st.sidebar.divider()
         st.sidebar.subheader("🔍 그래프 필터 및 검색")
-        
         all_types = list(set([n.get('type', 'Unknown') for n in st.session_state.graph_data['nodes']]))
         selected_types = st.sidebar.multiselect("표시할 타입", all_types, default=all_types)
         search_query = st.sidebar.text_input("🎯 노드 검색 (이름)")
@@ -137,7 +142,6 @@ if uploaded_files and api_key:
         col1, col2 = st.columns([3, 1])
         selected_id = None
         
-        # 컬러 맵핑
         file_names = [f.name for f in uploaded_files]
         color_palette = ["#4285F4", "#34A853", "#FBBC05", "#8E44AD", "#F39C12", "#16A085"]
         color_map = {name: color_palette[i % len(color_palette)] for i, name in enumerate(file_names)}
@@ -149,18 +153,13 @@ if uploaded_files and api_key:
             for n in st.session_state.graph_data['nodes']:
                 if n.get('type') in selected_types and search_query.lower() in n.get('label', '').lower():
                     src = n.get('source_file', 'Unknown')
-                    f_nodes.append(Node(id=n['id'], 
-                                       label=n['label'], 
-                                       size=25 if src=="Common" else 20, 
-                                       color=color_map.get(src, "#999999")))
+                    f_nodes.append(Node(id=n['id'], label=n['label'], size=25 if src=="Common" else 20, color=color_map.get(src, "#999999")))
                     f_node_ids.add(n['id'])
-            
             f_edges = [Edge(source=l['source'], target=l['target']) for l in st.session_state.graph_data['links'] 
                        if l['source'] in f_node_ids and l['target'] in f_node_ids]
 
             if f_nodes:
-                config = Config(width=900, height=600, directed=True, physics=True)
-                selected_id = agraph(nodes=f_nodes, edges=f_edges, config=config)
+                selected_id = agraph(nodes=f_nodes, edges=f_edges, config=Config(width=900, height=600, directed=True, physics=True))
 
         with col2:
             st.markdown("### 🎨 범례 및 상세")
@@ -187,8 +186,7 @@ if st.session_state.full_text:
     st.subheader("💬 데이터 기반 Q&A")
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]): st.markdown(msg["content"])
-
-    if chat_prompt := st.chat_input("분석된 유전체 결과에 대해 질문하세요."):
+    if chat_prompt := st.chat_input("질문하세요."):
         st.session_state.messages.append({"role": "user", "content": chat_prompt})
         with st.chat_message("user"): st.markdown(chat_prompt)
         try:
